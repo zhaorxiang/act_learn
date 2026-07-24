@@ -1,3 +1,8 @@
+'''
+采集机器人的数据
+'''
+
+
 import time
 import os
 import numpy as np

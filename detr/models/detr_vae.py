@@ -210,16 +210,21 @@ def mlp(input_dim, hidden_dim, output_dim, hidden_depth):
 
 
 def build_encoder(args):
-    d_model = args.hidden_dim # 256
-    dropout = args.dropout # 0.1
-    nhead = args.nheads # 8
-    dim_feedforward = args.dim_feedforward # 2048
-    num_encoder_layers = args.enc_layers # 4 # TODO shared with VAE decoder
-    normalize_before = args.pre_norm # False
-    activation = "relu"
+    d_model = args.hidden_dim # 256 特征向量的通道维度 dimension model
+    dropout = args.dropout # 0.1 丢弃率 
+    nhead = args.nheads # 8 多头注意力机制的头数
+    dim_feedforward = args.dim_feedforward # 2048 前馈神经网络的中间层通道数 dimension feedforward
+    num_encoder_layers = args.enc_layers # 4 # TODO shared with VAE decoder Transformer编码器的层数
+    normalize_before = args.pre_norm # False 层归一化的位置选择
+    # True:代表Pre-LN(前归一化)，即先做层归一化，在进行自注意力和FNN运算
+    # False:Post-LN(后归一化)，即先运算，最后在做层归一化
+    activation = "relu" # 激活函数
 
+    # 单层的Transformer编码层
     encoder_layer = TransformerEncoderLayer(d_model, nhead, dim_feedforward,
                                             dropout, activation, normalize_before)
+    
+    # 
     encoder_norm = nn.LayerNorm(d_model) if normalize_before else None
     encoder = TransformerEncoder(encoder_layer, num_encoder_layers, encoder_norm)
 
@@ -232,6 +237,9 @@ def build(args):
     # From state
     # backbone = None # from state for now, no need for conv nets
     # From image
+
+    # 用来装视觉骨干网络
+    # 可以只装一个给4个摄像头使用，也可以装4个给每个摄像头分配一个
     backbones = []
     backbone = build_backbone(args)
     backbones.append(backbone)
@@ -249,6 +257,12 @@ def build(args):
         camera_names=args.camera_names,
     )
 
+    # 统计模型大小
+    # model.parameters:遍历DETRVAE网络中所有层的所有参数张量
+    # if p.requires_grad:只有当参数的requires_grad=True时，才保留它
+    # numel:是Number of Elements的缩写
+    #直接把所有维度的乘积算出来，然后输出一共有多少个实数
+    # sum(...):把所有过滤出来的参数个数加载一起
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print("number of parameters: %.2fM" % (n_parameters/1e6,))
 

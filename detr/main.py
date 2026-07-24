@@ -68,22 +68,36 @@ def get_args_parser():
 
 
 def build_ACT_model_and_optimizer(args_override):
+    # 由于 ACT 是套用 Facebook 的 DETR Transformer 框架
+    # 这里创建一个 DETR 官方的命令行参数解析器
     parser = argparse.ArgumentParser('DETR training and evaluation script', parents=[get_args_parser()])
+    
+    # 将解析器里的默认配置参数读取出来，保存到 args 命名空间中
     args = parser.parse_args()
 
     for k, v in args_override.items():
+        # setattr(目标对象, 属性名字符串, 属性值)
         setattr(args, k, v)
 
     model = build_ACT_model(args)
     model.cuda()
 
+    # 分组使用使用AdamW优化器的标准写法，创建一个字典，内部调整所需要的参数
     param_dicts = [
+        # 第一组：所有不包含 "backbone" 关键字的普通网络层（Transformer、投影层等）
+        # 使用正常、较大的学习率 args.lr（例如 1e-5）
         {"params": [p for n, p in model.named_parameters() if "backbone" not in n and p.requires_grad]},
         {
+            # 第二组：所有包含 "backbone" 关键字的视觉骨干网络（ResNet18）
+            # 使用更小、更谨慎的学习率 args.lr_backbone（例如 1e-5 或更低），防止破坏预训练特征
             "params": [p for n, p in model.named_parameters() if "backbone" in n and p.requires_grad],
+            
+            # 字典内部制定的学习率超过全局学习率
             "lr": args.lr_backbone,
         },
     ]
+
+    # 使用 AdamW 优化器，将刚才分好组的参数字典 param_dicts 扔进去，进行差异化梯度更新
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
 
@@ -107,6 +121,7 @@ def build_CNNMLP_model_and_optimizer(args_override):
             "lr": args.lr_backbone,
         },
     ]
+
     optimizer = torch.optim.AdamW(param_dicts, lr=args.lr,
                                   weight_decay=args.weight_decay)
 

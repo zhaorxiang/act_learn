@@ -8,6 +8,9 @@ from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
 
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), 'detr'))
+
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN
 from utils import load_data # data functions
@@ -46,7 +49,8 @@ def main(args):
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
 
-    # fixed parameters
+    # fixed parameters:超参数
+    # lr_backbone:这么小，是为了微调，因为ResNet18是在ImgaeNet上面训练的差不多了
     state_dim = 14
     lr_backbone = 1e-5
     backbone = 'resnet18'
@@ -72,6 +76,7 @@ def main(args):
     else:
         raise NotImplementedError
 
+    # 参数超级字典
     config = {
         'num_epochs': num_epochs,
         'ckpt_dir': ckpt_dir,
@@ -88,6 +93,7 @@ def main(args):
         'real_robot': not is_sim
     }
 
+    # 进入评估模式,评估完成之后不再进行后面的代码:exit()
     if is_eval:
         ckpt_names = [f'policy_best.ckpt']
         results = []
@@ -106,9 +112,13 @@ def main(args):
     if not os.path.isdir(ckpt_dir):
         os.makedirs(ckpt_dir)
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
+
+    # 写入二进制（write binary，简称 'wb'）
     with open(stats_path, 'wb') as f:
+        # 这个之后在eval_bc函数中有使用过
         pickle.dump(stats, f)
 
+    # 最好的结果
     best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
 
@@ -149,33 +159,85 @@ def get_image(ts, camera_names):
 
 
 def eval_bc(config, ckpt_name, save_episode=True):
+    '''
+    Input:
+        config:乱七八糟的参数,具体在下面
+        ckpt_name:权重参数文件名称
+        save_episode:True就是生成一个mp4视频
+
+    Return:
+        success_rate:总体成功率
+        avg_return:平均得分,不成功也有得分,成功得分更高
+    '''
+# Behavior Cloning 是 eval_bc 中 bc 的含义
+
+# *******************************************************************
+# 初始化与参数读取
+
     set_seed(1000)
-    ckpt_dir = config['ckpt_dir']
-    state_dim = config['state_dim']
-    real_robot = config['real_robot']
-    policy_class = config['policy_class']
-    onscreen_render = config['onscreen_render']
+    ckpt_dir = config['ckpt_dir'] # 模型权重(.ckpt)和统计数据保存的文件夹路径
+    state_dim = config['state_dim'] # 机械臂状态的维度(双臂14自由度，所以是14)
+    real_robot = config['real_robot'] # True代表控制真机，False代表控制仿真
+    policy_class = config['policy_class'] # 使用的算法模型类(这里选ACT)
+    onscreen_render = config['onscreen_render'] # 是否弹窗实时显示机器人视角的动画
     policy_config = config['policy_config']
     camera_names = config['camera_names']
     max_timesteps = config['episode_len']
     task_name = config['task_name']
-    temporal_agg = config['temporal_agg']
-    onscreen_cam = 'angle'
+
+    temporal_agg = config['temporal_agg'] # 是否开启核心的时间集成 ！！！！！！！！！！！！
+
+    onscreen_cam = 'angle' # 指定弹窗换面渲染时使用仿真器中的哪个摄像机视角(此处为角度镜头)
+
+# ********************************************************************
+# 加载模型与统计数据
 
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
-    policy = make_policy(policy_class, policy_config)
+
+    # make_policy:根据网络结构的配置，搭建起一个Transformer + CVAE的神经网络空架子
+    policy = make_policy(policy_class, policy_config) 
+
+    # torch.load:把保存的.ckpt权重文件读进来(此时他只是一个权重字典)
+    # load_state_dict:把权重字典填入刚才建好的空架子里，让神经网络真正拥有"灵魂"(学到的参数)
     loading_status = policy.load_state_dict(torch.load(ckpt_path))
     print(loading_status)
     policy.cuda()
+
+    # 不使用Dropout和BatchNorm
     policy.eval()
     print(f'Loaded: {ckpt_path}')
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'rb') as f:
+    # pickle.load:使用python的pickle库加载训练时计算好的数据集均值和标准差，用于后续的数据标准化
+    # pickle是python官方提供的一个对象序列化工具，把复杂的python对象直接保存成一个二进制文件(.pkl)
+    # 读取时又可以原封不动地还原
         stats = pickle.load(f)
 
+# ********************************************************************
+# 数据预处理函数（Normalization）
+
+# s_qpos解释
+# s = sensor（传感器）
+# q = generalized coordinates（广义坐标）
+# pos = position
+# qpos = 完整的关节角度向量
+
+    # pre_process：一个 lambda 匿名函数
+    # 当输入真实的机械臂角度 s_qpos 时，自动减去均值 qpos_mean，再除以标准差 qpos_std
     pre_process = lambda s_qpos: (s_qpos - stats['qpos_mean']) / stats['qpos_std']
+
+    # post_process：反向操作
+    # 模型输出的动作为-1到1之间之间的无量纲数值，乘上标准差再加均值，还原为真实的电机目标角度
     post_process = lambda a: a * stats['action_std'] + stats['action_mean']
+
+# ********************************************************************
+# 环境加载
+
+# 强化学习/机器人标准环境接口(Gym-like API):
+# 几乎所有的机器人和强化学习代码都遵循一个行业标准(OpenAI Gym规范):用一个变量env代表物理世界
+# env.reset():重置环境，比如把机械臂摆回原位，把方块随机扔在桌子上
+# env.step(action):给机器人发送一步动作命令，仿真器向前模拟0.02秒，并返回最新的画面、关节角度和当前得分
 
     # load environment
     if real_robot:
@@ -184,45 +246,66 @@ def eval_bc(config, ckpt_name, save_episode=True):
         env = make_real_env(init_node=True)
         env_max_reward = 0
     else:
+        # make_sim_env(task_name)：启动 MuJoCo 仿真器并载入我们刚才提到的方块任务
+        # env_max_reward：每个任务都有自己的评分上限（比如方块任务中，成功抓起得 1 分，成功递交得 4 分，一共最高 4 分）
+        # 我们用这个值来判定机器人是否完美完成了任务
         from sim_env import make_sim_env
         env = make_sim_env(task_name)
         env_max_reward = env.task.max_reward
 
+# ********************************************************************
+# 时间聚合与评估步数设定
+
+    # query_frequency:提问频率，就是时间集成策略
+    # 如果开启(temporal_agg=True),那么就是开启query_frequency=1，不是就是不开启
     query_frequency = policy_config['num_queries']
     if temporal_agg:
         query_frequency = 1
+        
+        # 模型一次预测输出多少步动作？(ACT中通常是100步)
         num_queries = policy_config['num_queries']
 
     max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
 
-    num_rollouts = 50
-    episode_returns = []
-    highest_rewards = []
+# ********************************************************************
+# Rollout 测试主循环（核心部分）
+
+    #执行测试总次数！！！！！！！！！！！！！！！！！！！！！！！！！！
+    num_rollouts = 2
+
+    episode_returns = [] # 每一次尝试的总得分
+    highest_rewards = [] # 所有尝试的最高分数
     for rollout_id in range(num_rollouts):
         rollout_id += 0
         ### set task
         if 'sim_transfer_cube' in task_name:
-            BOX_POSE[0] = sample_box_pose() # used in sim reset
+            BOX_POSE[0] = sample_box_pose() # used in sim reset 每次尝试时，随机生成方块在桌子上的起始位置和朝向
         elif 'sim_insertion' in task_name:
             BOX_POSE[0] = np.concatenate(sample_insertion_pose()) # used in sim reset
 
-        ts = env.reset()
+        ts = env.reset() # 物理环境重置！方块被刷新到随机位置
 
-        ### onscreen render
+        ### onscreen render 弹窗渲染
         if onscreen_render:
             ax = plt.subplot()
             plt_img = ax.imshow(env._physics.render(height=480, width=640, camera_id=onscreen_cam))
-            plt.ion()
+            plt.ion() # 开启 Matplotlib 的交互模式，支持动态刷洗图片，而不是卡住显示静态图
 
         ### evaluation loop
         if temporal_agg:
+             # 准备一个全零的动作大张旗鼓：用来存放并累计不同时间步预测出的动作值，用于加权平均
             all_time_actions = torch.zeros([max_timesteps, max_timesteps+num_queries, state_dim]).cuda()
 
         qpos_history = torch.zeros((1, max_timesteps, state_dim)).cuda()
-        image_list = [] # for visualization
+        image_list = [] # for visualization 建立空列表，用来收集每一帧摄像头的画面，最后合成 mp4 视频
         qpos_list = []
         target_qpos_list = []
         rewards = []
+
+# ********************************************************************
+# 单步控制循环（真正让机器人产生行为的 for 循环）
+
+        # 不需要计算任何梯度，释放海量的内存开销，并将推理速度提到最高
         with torch.inference_mode():
             for t in range(max_timesteps):
                 ### update onscreen render and wait for DT
@@ -247,15 +330,23 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 if config['policy_class'] == "ACT":
                     if t % query_frequency == 0:
                         all_actions = policy(qpos, curr_image)
+
+                    # 时间集成的代码
                     if temporal_agg:
                         all_time_actions[[t], t:t+num_queries] = all_actions
+
+                        # 收集所有对"当前50步"做出过预测的历史动作值
                         actions_for_curr_step = all_time_actions[:, t]
                         actions_populated = torch.all(actions_for_curr_step != 0, axis=1)
                         actions_for_curr_step = actions_for_curr_step[actions_populated]
                         k = 0.01
+
+                        # 计算指数权重衰减:越是新的越大，越是老的越小
                         exp_weights = np.exp(-k * np.arange(len(actions_for_curr_step)))
                         exp_weights = exp_weights / exp_weights.sum()
                         exp_weights = torch.from_numpy(exp_weights).cuda().unsqueeze(dim=1)
+
+                        # 保留了最新的视觉，又保留了历史的连贯性，彻底笑出了机器人的关节抖动
                         raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
                     else:
                         raw_action = all_actions[:, t % query_frequency]
@@ -278,30 +369,46 @@ def eval_bc(config, ckpt_name, save_episode=True):
                 rewards.append(ts.reward)
 
             plt.close()
+
+# ********************************************************************
+# 单回合结束，收尾与视频保存
+
         if real_robot:
+
+            # 物理真机测试完后，自动把爪子张开，防止捏坏东西
             move_grippers([env.puppet_bot_left, env.puppet_bot_right], [PUPPET_GRIPPER_JOINT_OPEN] * 2, move_time=0.5)  # open
             pass
 
         rewards = np.array(rewards)
-        episode_return = np.sum(rewards[rewards!=None])
+        episode_return = np.sum(rewards[rewards!=None]) # 计算这一轮一共得了多少分
         episode_returns.append(episode_return)
-        episode_highest_reward = np.max(rewards)
+        episode_highest_reward = np.max(rewards) # 记录这一轮中曾经达到过的最高分
         highest_rewards.append(episode_highest_reward)
+
+        # 实时在控制台打印这一轮的结果：得分、是否成功完成任务等
         print(f'Rollout {rollout_id}\n{episode_return=}, {episode_highest_reward=}, {env_max_reward=}, Success: {episode_highest_reward==env_max_reward}')
 
         if save_episode:
+            # [核心存储行]：把 image_list 里面收集的所有图片帧，融合成一个 mp4 视频并保存到硬盘
             save_videos(image_list, DT, video_path=os.path.join(ckpt_dir, f'video{rollout_id}.mp4'))
 
+# ********************************************************************
+# 统计成功率并保存日志
+
+    # 计算有多少次尝试的最高得分达到了任务的最高限度，从而算出平均成功率
     success_rate = np.mean(np.array(highest_rewards) == env_max_reward)
     avg_return = np.mean(episode_returns)
     summary_str = f'\nSuccess rate: {success_rate}\nAverage return: {avg_return}\n\n'
+    
+    # 细化统计：比如得分大于等于 1 分的占比，大于等于 2 分的占比……
     for r in range(env_max_reward+1):
         more_or_equal_r = (np.array(highest_rewards) >= r).sum()
         more_or_equal_r_rate = more_or_equal_r / num_rollouts
         summary_str += f'Reward >= {r}: {more_or_equal_r}/{num_rollouts} = {more_or_equal_r_rate*100}%\n'
 
-    print(summary_str)
+    print(summary_str) # 控制台大字打印统计结果！
 
+    # 把统计结果、每一轮的详细得分自动写进一个 .txt 日志里，文件名为：result_policy_best.txt
     # save success rate to txt
     result_file_name = 'result_' + ckpt_name.split('.')[0] + '.txt'
     with open(os.path.join(ckpt_dir, result_file_name), 'w') as f:
@@ -310,7 +417,7 @@ def eval_bc(config, ckpt_name, save_episode=True):
         f.write('\n\n')
         f.write(repr(highest_rewards))
 
-    return success_rate, avg_return
+    return success_rate, avg_return # 返回给最外层，结束评估函数
 
 
 def forward_pass(data, policy):
@@ -329,6 +436,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     set_seed(seed)
 
     policy = make_policy(policy_class, policy_config)
+    # 必须在make_optimizer之前
     policy.cuda()
     optimizer = make_optimizer(policy_class, policy)
 

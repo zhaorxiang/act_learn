@@ -1,11 +1,25 @@
 import pathlib
 
 ### Task parameters
-DATA_DIR = '<put your data dir here>'
+DATA_DIR = './data'
+
+'''
+对下面的内容进行注释：
+sim:Simulation(仿真)的缩写
+transfer_cube(方块传输)
+insertion(插拔\插入)
+_scripted:脚本生成的专家数据，即人类写好控制算法在仿真世界里自动运行
+_human:人类手动的专家数据，人类操作员一点一点动手操作的，更接近真是人类
+dataset_dir:数据集文件夹路径
+num_episodes:演示录像总个数
+episode_len:每个回合的步数
+carema_name:使用的摄像头名称列表
+'''
+
 SIM_TASK_CONFIGS = {
     'sim_transfer_cube_scripted':{
         'dataset_dir': DATA_DIR + '/sim_transfer_cube_scripted',
-        'num_episodes': 50,
+        'num_episodes': 5,
         'episode_len': 400,
         'camera_names': ['top']
     },
